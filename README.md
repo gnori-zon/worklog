@@ -37,3 +37,9 @@ make run
 ```
 
 #### Demo
+
+##### Projects
+<img width="1624" height="995" alt="Снимок экрана 2026-11-12 в 18 44 43" src="https://github.com/user-attachments/assets/e0c354b2-c75d-4dff-8fb2-ce6ec0782d74" />
+
+##### Entries
+<img width="1624" height="995" alt="Снимок экрана 2026-11-12 в 18 44 27" src="https://github.com/user-attachments/assets/0b243b92-9de8-40a8-9188-09ce6e00f20c" />
