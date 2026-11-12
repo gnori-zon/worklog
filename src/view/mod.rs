@@ -1,337 +1,494 @@
 pub mod input_mapper;
 
-use chrono::{Local, NaiveDate, Utc};
+use chrono::{Local, TimeDelta, Utc};
 use ratatui::{
     Frame,
     buffer::CellWidth,
-    layout::{Constraint, Layout, Rect},
-    style::{Color, Style},
+    layout::{Alignment, Constraint, Layout, Rect},
+    style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Cell, Clear, Row, Table, TableState},
 };
 
 use crate::{
-    models, repository,
+    models,
+    repository::{self, EntryDateQuery},
     view_model::{
-        AppModel, Focus, Notification, NotificationLevel, TextInput, entries::EntriesModelMode,
+        AppModel, DateInput, Focus, Notification, NotificationLevel,
+        entries::{EntriesModelMode, EntryEditField, EntryEditModelMode},
         projects::ProjectModelMode,
     },
 };
 
-pub struct AppLayout {
-    header: HeaderView,
-    main: MainView,
-    footer: FooterView,
+pub fn render_app(frame: &mut Frame, model: &AppModel) {
+    match model.focus {
+        Focus::Projects => ProjectsScreen.render(frame, model),
+        Focus::Entries => EntriesScreen.render(frame, model),
+    }
 }
 
-impl AppLayout {
-    pub fn new() -> Self {
-        Self::new_with(HeaderView, MainView, FooterView)
-    }
+trait Screen {
+    fn render(&self, frame: &mut Frame, model: &AppModel);
+}
 
-    fn new_with(header: HeaderView, main: MainView, footer: FooterView) -> Self {
-        Self {
-            header,
-            main,
-            footer,
-        }
-    }
+struct ProjectsScreen;
+impl Screen for ProjectsScreen {
+    fn render(&self, frame: &mut Frame, model: &AppModel) {
+        let layout = Block::default()
+            .borders(Borders::ALL)
+            .title(Line::from(vec![Span::raw("Worklog")]))
+            .title(Line::from(format!("Version: {}", model.version)).right_aligned());
+        let main = layout.inner(frame.area());
+        frame.render_widget(layout, frame.area());
 
-    pub fn render(&self, frame: &mut Frame, model: &AppModel) {
-        let layout = Layout::vertical([
-            Constraint::Length(1),
+        let [main, footer, input] = Layout::vertical([
             Constraint::Min(0),
-            Constraint::Length(2),
-        ]);
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(main);
 
-        let [header, main, footer] = layout.areas(frame.area());
-
-        self.header.render(frame, header, model);
-        self.main.render(frame, main, model);
-        self.footer.render(frame, footer, model);
-    }
-}
-
-trait View {
-    fn render(&self, frame: &mut Frame, area: Rect, model: &AppModel);
-}
-
-struct HeaderView;
-
-impl View for HeaderView {
-    fn render(&self, frame: &mut Frame, area: Rect, model: &AppModel) {
-        frame.render_widget(Paragraph::new(format!("Worklog v{}", model.version)), area);
-    }
-}
-
-struct MainView;
-
-impl View for MainView {
-    fn render(&self, frame: &mut Frame, area: Rect, model: &AppModel) {
-        let area = render_block(frame, area, Block::bordered());
-
-        let [left, center] =
-            Layout::horizontal([Constraint::Percentage(20), Constraint::Percentage(80)])
-                .areas(area);
-
-        let left = render_block(
-            frame,
-            left,
-            mark_border_as_focused(Block::bordered(), Focus::ProjectsView, model.focus),
-        );
-        let center = render_block(
-            frame,
-            center,
-            mark_border_as_focused(Block::bordered(), Focus::EntriesView, model.focus),
-        );
-
-        // left
-        let [left_top, left] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(left);
-
+        // main
         let search_text = match &model.projects.query.name {
             repository::ProjectNameQuery::Any => String::new(),
             repository::ProjectNameQuery::Contains(text) => text.to_string(),
         };
-
-        let search_status = Paragraph::new(format!("Projects. Search: {}", search_text));
-        frame.render_widget(search_status, left_top);
-
-        let items = model
+        let header = Row::new(vec![
+            Cell::from(format!("Projects: {}", search_text)),
+            Cell::from("entries"),
+            Cell::from("time (7d)"),
+        ])
+        .style(Style::default().add_modifier(Modifier::BOLD));
+        let rows: Vec<Row> = model
             .projects
             .values
             .iter()
-            .map(|project| ListItem::new(project.name.as_str()));
+            .map(|project| {
+                let stats = model.projects.stats.get(&project.id).unwrap();
+                Row::new(vec![
+                    Cell::from(project.name.as_str()),
+                    Cell::from(format!("{}", stats.entries_count)),
+                    Cell::from(format_duration(stats.week_time)),
+                ])
+            })
+            .collect();
 
-        let list = List::new(items).highlight_style(Style::default().reversed());
-
-        let mut state = ListState::default();
+        let width = [
+            Constraint::Fill(1),    // name
+            Constraint::Length(8),  // entries
+            Constraint::Length(15), // time(7d)
+        ];
+        let table = Table::new(rows, width)
+            .header(header)
+            .block(Block::default())
+            .row_highlight_style(Style::default().reversed())
+            .column_spacing(2);
+        let mut state = TableState::default();
         state.select(model.projects.cursor.selected);
+        frame.render_stateful_widget(table, main, &mut state);
 
-        frame.render_stateful_widget(list, left, &mut state);
+        // input
+        match &model.projects.mode {
+            ProjectModelMode::View(notification) => match notification {
+                Some(notification) => render_notification(frame, input, notification),
+                None => {}
+            },
+            ProjectModelMode::Rename(text_input)
+            | ProjectModelMode::Create(text_input)
+            | ProjectModelMode::Search(text_input)
+            | ProjectModelMode::Delete(text_input) => {
+                render_input(frame, input, text_input.text.as_str())
+            }
+        }
 
-        // center
-        let [center_top, center] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(center);
+        let mode = match model.projects.mode {
+            ProjectModelMode::View(_) => Line::from("--NORMAL--"),
+            _ => Line::from("--INSERT--").style(Color::Green),
+        };
+
+        // footer
+        let hint_bar = Block::default()
+            .borders(Borders::TOP)
+            .title(mode.bold().alignment(Alignment::Left))
+            .title(Line::from(
+                [
+                    hint("n", "new"),
+                    hint("r", "rename"),
+                    hint("d", "delete"),
+                    hint("enter", "open entries"),
+                    hint("/", "search"),
+                    hint("<C-d>", "quit"),
+                ]
+                .concat(),
+            ))
+            .title_alignment(Alignment::Center);
+        frame.render_widget(hint_bar, footer);
+    }
+}
+
+struct EntriesScreen;
+impl Screen for EntriesScreen {
+    fn render(&self, frame: &mut Frame, model: &AppModel) {
+        let layout = Block::default()
+            .borders(Borders::ALL)
+            .title(Line::from(vec![
+                Span::raw("Worklog"),
+                Span::raw(" ▸ "),
+                Span::raw(model.projects.get_selected().unwrap().clone().name),
+            ]))
+            .title(Line::from(hint("Esc", "back")).right_aligned());
+        let main = layout.inner(frame.area());
+        frame.render_widget(layout, frame.area());
+
+        let [header, divider, main, footer, input] = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(main);
+
+        // header
+        let [search_status, filter_status] =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(header);
         let search_text = match &model.entries.query.name {
             repository::EntryNameQuery::Any => String::new(),
             repository::EntryNameQuery::Contains(text) => text.to_string(),
         };
+        frame.render_widget(
+            Line::from(vec![Span::raw(format!("Entries: {}", search_text))]),
+            search_status,
+        );
 
-        let search_status = Paragraph::new(format!("Entries. Search: {}", search_text));
-        frame.render_widget(search_status, center_top);
+        let selected_filter = model.entries.query.date.clone();
+        let filters: Vec<Span> = EntryDateQuery::all_cases()
+            .iter()
+            .cloned()
+            .enumerate()
+            .flat_map(|(i, date_query)| {
+                let mut result = vec![];
+                if i > 0 {
+                    result.push(Span::raw(" "));
+                } else {
+                    result.push(Span::raw("Filter: "));
+                }
+                let name = match date_query {
+                    EntryDateQuery::Any => "all",
+                    EntryDateQuery::Running => "running",
+                    EntryDateQuery::Today => "today",
+                    EntryDateQuery::Week => "week",
+                    EntryDateQuery::Mounth => "mounth",
+                };
+                let mut filter_span = Span::from(format!(" {} ", name));
+                if selected_filter == date_query {
+                    filter_span = filter_span.style(Style::default().reversed())
+                }
+                result.push(Span::raw("[ "));
+                result.push(filter_span);
+                result.push(Span::raw(" ]"));
+                result
+            })
+            .collect();
+        frame.render_widget(Line::from(filters), filter_status);
 
-        let [center_left, center_right] =
-            Layout::horizontal([Constraint::Length(2), Constraint::Min(0)]).areas(center);
-        let chanked_entries: Vec<&[models::Entry]> = model
+        // devider
+        frame.render_widget(Block::default().borders(Borders::TOP), divider);
+
+        // main
+        let rows: Vec<Row> = model
             .entries
             .values
-            .chunk_by(|lhs, rhs| {
-                lhs.started_at.with_timezone(&Local).date_naive()
-                    == rhs.started_at.with_timezone(&Local).date_naive()
-            })
-            .collect();
-
-        let entry_list_item: Vec<EntryListItem> = chanked_entries
             .iter()
-            .flat_map(|chunk| {
-                let mut items: Vec<EntryListItem> = Vec::with_capacity(chunk.len() + 1);
-                items.push(EntryListItem::Date(
-                    chunk
-                        .first()
-                        .unwrap()
-                        .started_at
-                        .with_timezone(&Local)
-                        .date_naive(),
-                ));
-                chunk
-                    .iter()
-                    .for_each(|entry| items.push(EntryListItem::EntryItem(entry.clone())));
-                items
-            })
-            .collect();
-
-        let selectable_indeces: Vec<usize> = entry_list_item
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| item.is_selectable())
-            .map(|(idx, _)| idx)
-            .collect();
-
-        let statuses = entry_list_item.iter().map(|item| match item {
-            EntryListItem::Date(_) => ListItem::new(Line::from(vec![Span::raw(" ")])),
-            EntryListItem::EntryItem(entry) => {
-                let color = if entry.ended_at.is_none() {
-                    Color::Green
+            .map(|entry| {
+                let (icon, icon_style, status) = if entry.ended_at.is_some() {
+                    ("✓", Style::default().fg(Color::DarkGray), "done")
                 } else {
-                    Color::Blue
+                    (
+                        "●",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                        "running",
+                    )
                 };
-                ListItem::new(Line::from(vec![Span::styled(
-                    "■ ",
-                    Style::default().fg(color),
-                )]))
+                Row::new(vec![
+                    Cell::from(icon).style(icon_style),
+                    Cell::from(status),
+                    Cell::from(entry.name.as_str()),
+                    Cell::from(format_date_range(entry.started_at, entry.ended_at)),
+                    Cell::from(format_duration(duration_from(
+                        entry.started_at,
+                        entry.ended_at,
+                    ))),
+                ])
+            })
+            .collect();
+
+        let width = [
+            Constraint::Length(2),  // icon
+            Constraint::Length(9),  // status
+            Constraint::Fill(1),    // name
+            Constraint::Length(36), // date range
+            Constraint::Length(15),
+        ];
+        let table = Table::new(rows, width)
+            .block(Block::default())
+            .row_highlight_style(Style::default().reversed())
+            .column_spacing(2);
+        let mut state = TableState::default();
+        state.select(model.entries.cursor.selected);
+        frame.render_stateful_widget(table, main, &mut state);
+
+        // popup
+        if let EntriesModelMode::Edit(entry, edit_mode) = &model.entries.mode {
+            let popup_area = centered_rect(60, 30, main);
+            frame.render_widget(Clear, popup_area);
+            let rows = vec![
+                Row::new(vec![
+                    Cell::from(String::from("Entry: ")),
+                    Cell::from(entry.name.as_str()),
+                ]),
+                Row::new(vec![
+                    Cell::from(String::from("Started at: ")),
+                    Cell::from(
+                        entry
+                            .started_at
+                            .with_timezone(&Local)
+                            .format(DATE_TIME_FORMAT)
+                            .to_string(),
+                    ),
+                ]),
+                Row::new(vec![
+                    Cell::from(String::from("Ended at: ")),
+                    Cell::from(
+                        entry
+                            .ended_at
+                            .map(|ended_at| {
+                                ended_at
+                                    .with_timezone(&Local)
+                                    .format(DATE_TIME_FORMAT)
+                                    .to_string()
+                            })
+                            .unwrap_or_else(|| String::from("-")),
+                    ),
+                ]),
+                Row::new(vec![
+                    Cell::from(String::from("Duration: ")),
+                    Cell::from(format_duration(duration_from(
+                        entry.started_at,
+                        entry.ended_at,
+                    ))),
+                ]),
+            ];
+
+            let width = [
+                Constraint::Length(12), // field name
+                Constraint::Fill(1),    // value
+            ];
+
+            let table = Table::new(rows, width)
+                .block(Block::bordered().title(Line::from("").bold().alignment(Alignment::Left)))
+                .row_highlight_style(Style::default().reversed())
+                .column_spacing(2);
+            let mut state = TableState::default();
+            match edit_mode {
+                EntryEditModelMode::View(model_view) => match model_view.selected_field {
+                    EntryEditField::StartedAt => state.select(Some(1)),
+                    EntryEditField::EndedAt => state.select(Some(2)),
+                },
+                EntryEditModelMode::EditStartedAt(_) => state.select(Some(1)),
+                EntryEditModelMode::EditEndedAt(_) => state.select(Some(2)),
             }
-        });
-        let list_statues = List::new(statuses);
-        frame.render_widget(list_statues, center_left);
-
-        let items = entry_list_item.iter().map(|item| match item {
-            EntryListItem::Date(naive_date) => ListItem::new(
-                Line::from(vec![Span::styled(
-                    format!("{}", naive_date.format(DATE_FORMAT)),
-                    Style::default(),
-                )])
-                .centered(),
-            ),
-            EntryListItem::EntryItem(entry) => ListItem::new(Line::from(vec![
-                Span::raw(format!(
-                    "{} ",
-                    entry.started_at.with_timezone(&Local).format(TIME_FORMAT)
-                )),
-                Span::raw(format!("{} ", entry.name.as_str())),
-                Span::raw(format!(
-                    "{}",
-                    format_duration(entry.started_at, entry.ended_at)
-                )),
-            ])),
-        });
-        let list_items = List::new(items).highlight_style(Style::default().reversed());
-        let mut list_items_state = ListState::default();
-
-        let selected_index: Option<usize> = model
-            .entries
-            .cursor
-            .selected
-            .and_then(|idx| selectable_indeces.get(idx).map(|real_idx| real_idx.clone()));
-
-        list_items_state.select(selected_index);
-
-        frame.render_stateful_widget(list_items, center_right, &mut list_items_state);
-    }
-}
-
-enum EntryListItem {
-    Date(NaiveDate),
-    EntryItem(models::Entry),
-}
-
-impl EntryListItem {
-    fn is_selectable(&self) -> bool {
-        match self {
-            EntryListItem::Date(_) => false,
-            EntryListItem::EntryItem(_) => true,
+            frame.render_stateful_widget(table, popup_area, &mut state);
         }
+
+        // input
+        match &model.entries.mode {
+            EntriesModelMode::View(notification) => match notification {
+                Some(notification) => render_notification(frame, input, notification),
+                None => {}
+            },
+            EntriesModelMode::Rename(text_input)
+            | EntriesModelMode::Create(_, text_input)
+            | EntriesModelMode::Search(_, text_input)
+            | EntriesModelMode::Delete(text_input) => {
+                render_input(frame, input, text_input.text.as_str())
+            }
+            EntriesModelMode::Edit(_, edit_mode) => match edit_mode {
+                EntryEditModelMode::View(model_view) => match &model_view.notification {
+                    Some(notification) => render_notification(frame, input, notification),
+                    None => {}
+                },
+                EntryEditModelMode::EditStartedAt(date_input) => {
+                    render_date_input(frame, input, date_input)
+                }
+                EntryEditModelMode::EditEndedAt(date_input) => {
+                    render_date_input(frame, input, date_input)
+                }
+            },
+        }
+        let mode = match &model.entries.mode {
+            EntriesModelMode::View(_) => Line::from("--NORMAL--"),
+            EntriesModelMode::Edit(_, edit_mode) => match edit_mode {
+                EntryEditModelMode::View(_) => Line::from("--NORMAL--"),
+                _ => Line::from("--INSERT--").style(Color::Green),
+            },
+            _ => Line::from("--INSERT--").style(Color::Green),
+        };
+
+        // footer
+        let hint_bar = match &model.entries.mode {
+            EntriesModelMode::Edit(_, _) => Block::default()
+                .borders(Borders::TOP)
+                .title(mode.bold().alignment(Alignment::Left))
+                .title(
+                    Line::from(
+                        [
+                            hint("esc", "cancel"),
+                            hint("enter", "complete"),
+                            hint("i", "edit"),
+                        ]
+                        .concat(),
+                    )
+                    .alignment(Alignment::Center),
+                ),
+            _ => Block::default()
+                .borders(Borders::TOP)
+                .title(mode.bold().alignment(Alignment::Left))
+                .title(
+                    Line::from(
+                        [
+                            hint("n", "new"),
+                            hint("r", "rename"),
+                            hint("i", "edit"),
+                            hint("space", "toggle running"),
+                            hint("d", "delete"),
+                            hint("/", "search"),
+                            hint("<C-d>", "quit"),
+                        ]
+                        .concat(),
+                    )
+                    .alignment(Alignment::Center),
+                ),
+        };
+        frame.render_widget(hint_bar, footer);
     }
+}
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let horizontal = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(width),
+        Constraint::Fill(1),
+    ])
+    .split(area);
+
+    Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(height),
+        Constraint::Fill(1),
+    ])
+    .split(horizontal[1])[1]
+}
+
+fn render_input(frame: &mut Frame, area: Rect, text: &str) {
+    frame.render_widget(Line::from(text), area);
+    frame.set_cursor_position((area.x + text.cell_width(), area.y));
+}
+
+fn render_date_input(frame: &mut Frame, area: Rect, date_input: &DateInput) {
+    let date_str = date_input
+        .date
+        .with_timezone(&Local)
+        .format(DATE_TIME_FORMAT)
+        .to_string();
+    // DATE_TIME_FORMAT = "%Y.%m.%d %H:%M"
+    let cursor_idx = match date_input.cursor {
+        crate::view_model::DateInputCursor::YearThousand => 0,
+        crate::view_model::DateInputCursor::YearHundred => 1,
+        crate::view_model::DateInputCursor::YearDecimal => 2,
+        crate::view_model::DateInputCursor::YearUnit => 3,
+        crate::view_model::DateInputCursor::MonthDecimal => 5, // skip '.'
+        crate::view_model::DateInputCursor::MonthUnit => 6,
+        crate::view_model::DateInputCursor::DayDecimal => 8, // skip '.'
+        crate::view_model::DateInputCursor::DayUnit => 9,
+        crate::view_model::DateInputCursor::HourDecimal => 11, // skip ' '
+        crate::view_model::DateInputCursor::HourUnit => 12,
+        crate::view_model::DateInputCursor::MinuteDecimal => 14, // skip ':'
+        crate::view_model::DateInputCursor::MuniteUnit => 15,
+    };
+    frame.render_widget(Line::from(date_str), area);
+    frame.set_cursor_position((area.x + cursor_idx, area.y));
+}
+
+fn render_notification(frame: &mut Frame, area: Rect, notification: &Notification) {
+    let color = match notification.level {
+        NotificationLevel::Success => Color::Green,
+        NotificationLevel::Failure => Color::Red,
+    };
+    frame.render_widget(
+        Line::styled(notification.text.as_str(), Style::default().fg(color)),
+        area,
+    );
+}
+
+fn hint(key: &str, label: &str) -> Vec<Span<'static>> {
+    vec![hint_key(key), Span::raw(format!(" {} ", label))]
+}
+
+fn hint_key(key: &str) -> Span<'static> {
+    Span::styled(
+        format!("[{}]", key),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 const TIME_FORMAT: &str = "%H:%M";
-const DATE_FORMAT: &str = "%d.%m.%Y";
+const DATE_TIME_FORMAT: &str = "%Y.%m.%d %H:%M";
 
-fn format_duration(start: models::DateTime, end: Option<models::DateTime>) -> String {
-    let duration = match end {
+fn format_date_range(start: models::DateTime, end: Option<models::DateTime>) -> String {
+    let mut formatted = String::new();
+    let local_start = start.with_timezone(&Local);
+    formatted.push_str(format!("{} → ", local_start.format(DATE_TIME_FORMAT)).as_str());
+    match end {
+        Some(end) => {
+            let local_end = end.with_timezone(&Local);
+            let formatted_end = if end.date_naive().eq(&start.date_naive()) {
+                local_end.format(TIME_FORMAT)
+            } else {
+                local_end.format(DATE_TIME_FORMAT)
+            };
+            formatted.push_str(format!("{}", formatted_end).as_str());
+        }
+        None => {
+            formatted.push_str("...");
+        }
+    };
+    formatted
+}
+
+fn format_duration(duration: TimeDelta) -> String {
+    let days = duration.num_days();
+    let hours = duration.num_hours() % 24;
+    let minutes = duration.num_minutes() % 60;
+    let mut formatted = String::new();
+    if days > 0 {
+        formatted.push_str(format!("{days}d ").as_str());
+    }
+    if hours > 0 {
+        formatted.push_str(format!("{hours}h ").as_str());
+    }
+
+    formatted.push_str(format!("{minutes}m").as_str());
+    formatted
+}
+
+fn duration_from(start: models::DateTime, end: Option<models::DateTime>) -> TimeDelta {
+    match end {
         Some(end) => end - start,
         None => Utc::now() - start,
-    };
-
-    let hours = duration.num_hours();
-    let minutes = duration.num_minutes() % 60;
-
-    if hours > 0 {
-        format!("{hours}h {minutes}m")
-    } else {
-        format!("{minutes}m")
-    }
-}
-
-fn mark_border_as_focused(block: Block, expected: Focus, actual: Focus) -> Block {
-    if expected == actual {
-        block.border_style(Style::new().yellow())
-    } else {
-        block
-    }
-}
-
-fn render_block(frame: &mut Frame, area: Rect, block: Block) -> Rect {
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    inner
-}
-
-struct FooterView;
-
-impl FooterView {
-    fn render_help_msg(&self, frame: &mut Frame, area: Rect) {
-        frame.render_widget(
-            Paragraph::new("[q] Quit [r] Rename [n] Create [d] Delete [/] Search"),
-            area,
-        );
-    }
-
-    fn draw_input_field(&self, frame: &mut Frame<'_>, area: Rect, text_input: &TextInput) {
-        let paragraph = Paragraph::new(text_input.text.as_str());
-        frame.render_widget(paragraph, area);
-        frame.set_cursor_position((area.x + text_input.text.cell_width(), area.y));
-    }
-
-    fn render_notification(&self, frame: &mut Frame, area: Rect, notification: &Notification) {
-        let color = match notification.level {
-            NotificationLevel::Success => Color::Green,
-            NotificationLevel::Failure => Color::Red,
-        };
-        let paragraph = Paragraph::new(
-            Line::from(notification.text.as_str()).style(Style::default().fg(color)),
-        );
-        frame.render_widget(paragraph, area);
-    }
-}
-
-impl View for FooterView {
-    fn render(&self, frame: &mut Frame, area: Rect, model: &AppModel) {
-        let [notification_or_input_area, help_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
-        self.render_help_msg(frame, help_area);
-        match model.focus {
-            Focus::ProjectsView => match &model.projects.mode {
-                ProjectModelMode::View(notification) => match notification {
-                    Some(notification) => {
-                        self.render_notification(frame, notification_or_input_area, notification)
-                    }
-                    None => {}
-                },
-                ProjectModelMode::Rename(text_input) => {
-                    self.draw_input_field(frame, notification_or_input_area, text_input)
-                }
-                ProjectModelMode::Create(text_input) => {
-                    self.draw_input_field(frame, notification_or_input_area, text_input)
-                }
-                ProjectModelMode::Search(text_input) => {
-                    self.draw_input_field(frame, notification_or_input_area, text_input)
-                }
-                ProjectModelMode::Delete(text_input) => {
-                    self.draw_input_field(frame, notification_or_input_area, text_input)
-                }
-            },
-            Focus::EntriesView => match &model.entries.mode {
-                EntriesModelMode::View(notification) => match notification {
-                    Some(notification) => {
-                        self.render_notification(frame, notification_or_input_area, notification)
-                    }
-                    None => {}
-                },
-                EntriesModelMode::Rename(text_input) => {
-                    self.draw_input_field(frame, notification_or_input_area, text_input)
-                }
-                EntriesModelMode::Create(_, text_input) => {
-                    self.draw_input_field(frame, notification_or_input_area, text_input)
-                }
-                EntriesModelMode::Search(_, text_input) => {
-                    self.draw_input_field(frame, notification_or_input_area, text_input)
-                }
-                EntriesModelMode::Delete(text_input) => {
-                    self.draw_input_field(frame, notification_or_input_area, text_input)
-                }
-            },
-            Focus::StatsView => {}
-        };
     }
 }

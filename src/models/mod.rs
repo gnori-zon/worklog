@@ -1,4 +1,4 @@
-use chrono::{self};
+use chrono::{self, Duration};
 use uuid::Uuid;
 
 pub type DateTime = chrono::DateTime<chrono::Utc>;
@@ -21,4 +21,11 @@ pub struct Entry {
     pub name: String,
     pub started_at: DateTime,
     pub ended_at: Option<DateTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectStats {
+    pub project_id: ProjectId,
+    pub entries_count: usize,
+    pub week_time: Duration,
 }

@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use uuid::Uuid;
 
-use crate::repository::ProjectRepository;
+use crate::repository::{ProjectRepository, ProjectStatsQuery, ProjectStatsRepository};
 use crate::{
     Service, models, repository,
     view_model::{
@@ -24,6 +26,7 @@ pub enum ProjectsMsg {
 
 pub struct ProjectsModel {
     pub values: Vec<models::Project>,
+    pub stats: HashMap<models::ProjectId, models::ProjectStats>,
     pub query: repository::ProjectQuery,
     pub paging: repository::Paging,
     pub cursor: Cursor,
@@ -45,15 +48,15 @@ impl ProjectsModel {
         match msg {
             ProjectsMsg::SelectNext => {
                 self.cursor.increment(self.values.len());
-                next_msg = Some(Msg::Entries(EntriesMsg::ChangedProject(
-                    self.get_selected().unwrap().id,
-                )));
+                next_msg = self
+                    .get_selected()
+                    .map(|selected| Msg::Entries(EntriesMsg::ChangedProject(selected.id)));
             }
             ProjectsMsg::SelectPrev => {
                 self.cursor.decrement(self.values.len());
-                next_msg = Some(Msg::Entries(EntriesMsg::ChangedProject(
-                    self.get_selected().unwrap().id,
-                )));
+                next_msg = self
+                    .get_selected()
+                    .map(|selected| Msg::Entries(EntriesMsg::ChangedProject(selected.id)));
             }
             ProjectsMsg::Create => self.change_mode(ProjectModelMode::Create(TextInput::default())),
             ProjectsMsg::Delete => self.change_mode(ProjectModelMode::Delete(TextInput::default())),
@@ -175,7 +178,7 @@ impl ProjectsModel {
                 level: NotificationLevel::Success,
             },
             Err(err) => Notification {
-                text: format!("Failed create {}: {}", name, create_message(err)),
+                text: format!("Failed create {}: {}", name, create_message(&err)),
                 level: NotificationLevel::Failure,
             },
         };
@@ -209,7 +212,7 @@ impl ProjectsModel {
                     "Failed rename {} to {}: {}",
                     old_name,
                     new_name,
-                    create_message(err)
+                    create_message(&err)
                 ),
                 level: NotificationLevel::Failure,
             },
@@ -237,12 +240,27 @@ impl ProjectsModel {
         self.delete_selected(service)
     }
 
-    fn reload_values<S: Service>(&mut self, service: &S) {
+    pub fn reload_values<S: Service>(&mut self, service: &S) {
         self.values = service
             .project_repository()
             .list(self.query.clone(), self.paging.clone())
             .unwrap();
         self.cursor.reset(self.values.len());
+        self.reload_project_stats(service);
+    }
+
+    fn reload_project_stats<S: Service>(&mut self, service: &S) {
+        self.stats = service
+            .project_stats_repository()
+            .list(ProjectStatsQuery::WeeklyBy(
+                self.values.iter().map(|project| project.id).collect(),
+            ))
+            .unwrap()
+            .iter()
+            .fold(HashMap::new(), |mut acc, project_stat| {
+                acc.insert(project_stat.project_id, project_stat.clone());
+                acc
+            });
     }
 
     fn delete_selected<S: Service>(&mut self, service: &S) -> Option<Notification> {
@@ -259,7 +277,7 @@ impl ProjectsModel {
                         level: NotificationLevel::Success,
                     },
                     Err(err) => Notification {
-                        text: format!("Failed delete {}: {}", deleted.name, create_message(err)),
+                        text: format!("Failed delete {}: {}", deleted.name, create_message(&err)),
                         level: NotificationLevel::Failure,
                     },
                 };

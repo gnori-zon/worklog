@@ -1,7 +1,17 @@
 pub mod entries;
 pub mod projects;
 
-use crate::{Service, repository};
+use chrono::{Datelike, Local, Timelike};
+
+use crate::{
+    Service,
+    models::{self},
+    repository,
+    view_model::DateInputCursor::{
+        DayDecimal, DayUnit, HourDecimal, HourUnit, MinuteDecimal, MonthDecimal, MonthUnit,
+        MuniteUnit, YearDecimal, YearHundred, YearThousand, YearUnit,
+    },
+};
 
 pub struct AppModel {
     pub should_quit: bool,
@@ -14,7 +24,7 @@ pub struct AppModel {
 impl AppModel {
     pub fn handle_msg<S: Service>(&mut self, msg: Msg, service: &S) -> Option<Msg> {
         match msg {
-            Msg::Focus(focus_msg) => self.handle_focus_msg(focus_msg),
+            Msg::Focus(focus_msg) => self.handle_focus_msg(focus_msg, service),
             Msg::Projects(projects_msg) => self.projects.handle_msg(projects_msg, service),
             Msg::Entries(entries_msg) => self.entries.handle_msg(entries_msg, service),
             Msg::Quit => {
@@ -24,10 +34,13 @@ impl AppModel {
         }
     }
 
-    fn handle_focus_msg(&mut self, msg: FocusMsg) -> Option<Msg> {
+    fn handle_focus_msg<S: Service>(&mut self, msg: FocusMsg, service: &S) -> Option<Msg> {
         match msg {
-            FocusMsg::SelectNext => self.focus = self.focus.next(),
-            FocusMsg::SelectPrev => self.focus = self.focus.prev(),
+            FocusMsg::Projects => {
+                self.focus = Focus::Projects;
+                self.projects.reload_values(service);
+            }
+            FocusMsg::Entries => self.focus = Focus::Entries,
         };
         None
     }
@@ -41,11 +54,11 @@ pub enum Msg {
 }
 
 pub enum FocusMsg {
-    SelectNext,
-    SelectPrev,
+    Projects,
+    Entries,
 }
 
-fn create_message(err: repository::Error) -> String {
+fn create_message(err: &repository::Error) -> String {
     match err {
         repository::Error::NotExistsById(_) => String::from("not found by id"),
         repository::Error::NameAlreadyUsed(_) => String::from("name already used"),
@@ -69,27 +82,8 @@ fn create_message(err: repository::Error) -> String {
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Focus {
-    ProjectsView,
-    EntriesView,
-    StatsView,
-}
-
-impl Focus {
-    fn next(&self) -> Focus {
-        match self {
-            Focus::ProjectsView => Focus::EntriesView,
-            Focus::EntriesView => Focus::StatsView,
-            Focus::StatsView => self.clone(),
-        }
-    }
-
-    fn prev(&self) -> Focus {
-        match self {
-            Focus::ProjectsView => self.clone(),
-            Focus::EntriesView => Focus::ProjectsView,
-            Focus::StatsView => Focus::EntriesView,
-        }
-    }
+    Projects,
+    Entries,
 }
 
 #[derive(Default)]
@@ -148,6 +142,70 @@ pub struct TextInput {
     pub text: String,
 }
 
+#[derive(Default, Clone)]
+pub struct DateInput {
+    pub date: models::DateTime,
+    pub cursor: DateInputCursor,
+}
+
+#[derive(Clone)]
+pub enum DateInputCursor {
+    YearThousand,
+    YearHundred,
+    YearDecimal,
+    YearUnit,
+    MonthDecimal,
+    MonthUnit,
+    DayDecimal,
+    DayUnit,
+    HourDecimal,
+    HourUnit,
+    MinuteDecimal,
+    MuniteUnit,
+}
+
+impl Default for DateInputCursor {
+    fn default() -> Self {
+        DateInputCursor::MuniteUnit
+    }
+}
+
+impl DateInputCursor {
+    fn next(&self) -> Self {
+        match self {
+            DateInputCursor::YearThousand => YearHundred,
+            DateInputCursor::YearHundred => YearDecimal,
+            DateInputCursor::YearDecimal => YearUnit,
+            DateInputCursor::YearUnit => MonthDecimal,
+            DateInputCursor::MonthDecimal => MonthUnit,
+            DateInputCursor::MonthUnit => DayDecimal,
+            DateInputCursor::DayDecimal => DayUnit,
+            DateInputCursor::DayUnit => HourDecimal,
+            DateInputCursor::HourDecimal => HourUnit,
+            DateInputCursor::HourUnit => MinuteDecimal,
+            DateInputCursor::MinuteDecimal => MuniteUnit,
+            DateInputCursor::MuniteUnit => MuniteUnit,
+        }
+    }
+
+    fn prev(&self) -> Self {
+        match self {
+            DateInputCursor::YearThousand => YearThousand,
+            DateInputCursor::YearHundred => YearThousand,
+            DateInputCursor::YearDecimal => YearHundred,
+            DateInputCursor::YearUnit => YearDecimal,
+            DateInputCursor::MonthDecimal => YearUnit,
+            DateInputCursor::MonthUnit => MonthDecimal,
+            DateInputCursor::DayDecimal => MonthUnit,
+            DateInputCursor::DayUnit => DayDecimal,
+            DateInputCursor::HourDecimal => DayUnit,
+            DateInputCursor::HourUnit => HourDecimal,
+            DateInputCursor::MinuteDecimal => HourUnit,
+            DateInputCursor::MuniteUnit => MinuteDecimal,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Notification {
     pub text: String,
@@ -167,5 +225,132 @@ impl TextInput {
 
     fn backspace(&mut self) {
         self.text.pop();
+    }
+}
+
+impl DateInput {
+    fn push_local_tz(&mut self, ch: char) {
+        let Some(digit) = ch.to_digit(10).map(|it| it as i32) else {
+            return;
+        };
+        let mut local = self.date.with_timezone(&Local);
+        let changed = match self.cursor {
+            DateInputCursor::YearThousand => {
+                let new_year = local.year() % 1000 + digit * 1000;
+                if let Some(changed) = local.with_year(new_year) {
+                    local = changed;
+                    true
+                } else {
+                    false
+                }
+            }
+            DateInputCursor::YearHundred => {
+                let new_year = local.year() / 1000 * 1000 + local.year() % 100 + digit * 100;
+                if let Some(changed) = local.with_year(new_year) {
+                    local = changed;
+                    true
+                } else {
+                    false
+                }
+            }
+            DateInputCursor::YearDecimal => {
+                let new_year = local.year() / 100 * 100 + local.year() % 10 + digit * 10;
+                if let Some(changed) = local.with_year(new_year) {
+                    local = changed;
+                    true
+                } else {
+                    false
+                }
+            }
+            DateInputCursor::YearUnit => {
+                let new_year = local.year() / 10 * 10 + digit;
+                if let Some(changed) = local.with_year(new_year) {
+                    local = changed;
+                    true
+                } else {
+                    false
+                }
+            }
+            DateInputCursor::MonthDecimal => {
+                let new_month = local.month() as i32 % 10 + digit * 10;
+                if let Some(changed) = local.with_month(new_month as u32) {
+                    local = changed;
+                    true
+                } else {
+                    false
+                }
+            }
+            DateInputCursor::MonthUnit => {
+                let new_month = local.month() as i32 / 10 * 10 + digit;
+                if let Some(changed) = local.with_month(new_month as u32) {
+                    local = changed;
+                    true
+                } else {
+                    false
+                }
+            }
+            DateInputCursor::DayDecimal => {
+                let new_day = local.day() as i32 % 10 + digit * 10;
+                if let Some(changed) = local.with_day(new_day as u32) {
+                    local = changed;
+                    true
+                } else {
+                    false
+                }
+            }
+            DateInputCursor::DayUnit => {
+                let new_day = local.day() as i32 / 10 * 10 + digit;
+                if let Some(changed) = local.with_day(new_day as u32) {
+                    local = changed;
+                    true
+                } else {
+                    false
+                }
+            }
+            DateInputCursor::HourDecimal => {
+                let new_hour = local.hour() as i32 % 10 + digit * 10;
+                if let Some(changed) = local.with_hour(new_hour as u32) {
+                    local = changed;
+                    true
+                } else {
+                    false
+                }
+            }
+            DateInputCursor::HourUnit => {
+                let new_hour = local.hour() as i32 / 10 * 10 + digit;
+                if let Some(changed) = local.with_hour(new_hour as u32) {
+                    local = changed;
+                    true
+                } else {
+                    false
+                }
+            }
+            DateInputCursor::MinuteDecimal => {
+                let new_minute = local.minute() as i32 % 10 + digit * 10;
+                if let Some(changed) = local.with_minute(new_minute as u32) {
+                    local = changed;
+                    true
+                } else {
+                    false
+                }
+            }
+            DateInputCursor::MuniteUnit => {
+                let new_minute = local.minute() as i32 / 10 * 10 + digit;
+                if let Some(changed) = local.with_minute(new_minute as u32) {
+                    local = changed;
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if changed {
+            self.cursor = self.cursor.next();
+            self.date = local.to_utc();
+        }
+    }
+
+    fn move_cursor_to_back(&mut self) {
+        self.cursor = self.cursor.prev();
     }
 }

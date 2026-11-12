@@ -1,10 +1,10 @@
-use crate::models::{DateTime, Entry, EntryId};
-use crate::repository::EntryNameQuery;
-use crate::repository::ProjectNameQuery;
+use crate::models::{DateTime, Entry, EntryId, ProjectStats};
+use crate::repository::{EntryDateQuery, EntryNameQuery, ProjectStatsRepository};
 use crate::repository::{
     EntryProjectQuery::{Any, In},
     EntryQuery, Paging, ProjectQuery, Result,
 };
+use crate::repository::{ProjectNameQuery, ProjectStatsQuery};
 use crate::{
     models::{Project, ProjectId},
     repository::{
@@ -14,7 +14,9 @@ use crate::{
         NameAlreadyUsed, ProjectRepository,
     },
 };
+use chrono::{Datelike, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::{collections::HashSet, fs, path::PathBuf, str::FromStr, sync::RwLock};
 
 pub struct JsonProjectRepository {
@@ -202,9 +204,24 @@ impl ProjectRepository for JsonProjectRepository {
     }
 }
 
+pub enum NowProvider {
+    Real,
+    Stub(DateTime),
+}
+
+impl NowProvider {
+    pub fn now(&self) -> DateTime {
+        match self {
+            NowProvider::Real => Utc::now(),
+            NowProvider::Stub(date_time) => date_time.clone(),
+        }
+    }
+}
+
 pub struct JsonEntryRepository {
     path: PathBuf,
     entries: RwLock<Vec<Entry>>,
+    now_provider: NowProvider,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,12 +258,17 @@ impl EntriesState {
 }
 
 impl JsonEntryRepository {
-    pub fn new(path: PathBuf) -> Result<Self> {
+    fn new_with_now_provider(path: PathBuf, now_provider: NowProvider) -> Result<Self> {
         let entries = JsonEntryRepository::load(&path)?;
         Ok(Self {
             path: path,
             entries: RwLock::new(entries),
+            now_provider: now_provider,
         })
+    }
+
+    pub fn new(path: PathBuf) -> Result<Self> {
+        Self::new_with_now_provider(path, NowProvider::Real)
     }
 
     fn load(path: &PathBuf) -> Result<Vec<Entry>> {
@@ -254,7 +276,8 @@ impl JsonEntryRepository {
         let state: EntriesState = serde_json::from_str(&text)?;
         let mut entries: Vec<Entry> = Vec::with_capacity(state.entries.len());
         let mut unique_ids: HashSet<ProjectId> = HashSet::with_capacity(state.entries.len());
-        let mut unique_names: HashSet<String> = HashSet::with_capacity(state.entries.len());
+        let mut unique_names: HashSet<(String, ProjectId)> =
+            HashSet::with_capacity(state.entries.len());
         for entry_state in state.entries.iter().cloned() {
             let id = EntryId::from_str(entry_state.id.as_str())?;
             let project_id = ProjectId::from_str(entry_state.project_id.as_str())?;
@@ -262,7 +285,7 @@ impl JsonEntryRepository {
                 return Err(Error::BrokenState(HasDuplicateIds(id.to_string())));
             }
             let name = entry_state.name;
-            if !unique_names.insert(name.clone()) {
+            if !unique_names.insert((name.clone(), project_id)) {
                 return Err(Error::BrokenState(HasDuplicateNames(name)));
             }
             entries.push(Entry {
@@ -296,7 +319,7 @@ impl JsonEntryRepository {
 }
 
 impl EntryQuery {
-    fn is_match(&self, entry: &Entry) -> bool {
+    fn is_match(&self, entry: &Entry, now: DateTime) -> bool {
         let name_is_match = match &self.name {
             EntryNameQuery::Contains(query_name) => entry.name.contains(query_name.as_str()),
             EntryNameQuery::Any => true,
@@ -308,17 +331,120 @@ impl EntryQuery {
             In(query_project_id) => entry.project_id == *query_project_id,
             Any => true,
         };
-        project_is_match
+        if !project_is_match {
+            return false;
+        }
+        let now_date = now.date_naive();
+        let date_is_match = match &self.date {
+            EntryDateQuery::Any => true,
+            EntryDateQuery::Today => entry
+                .ended_at
+                .map(|ended_at| ended_at.date_naive() == now_date)
+                .unwrap_or(true),
+            EntryDateQuery::Week => entry
+                .ended_at
+                .map(|ended_at| {
+                    let ended_at = ended_at.date_naive();
+                    let now_week = now_date.iso_week();
+                    let ended_at_week = ended_at.iso_week();
+                    ended_at_week.year() == now_week.year()
+                        && ended_at_week.week() == now_week.week()
+                })
+                .unwrap_or(true),
+            EntryDateQuery::Mounth => entry
+                .ended_at
+                .map(|ended_at| {
+                    let ended_at = ended_at.date_naive();
+                    ended_at.year() == now_date.year() && ended_at.month() == now_date.month()
+                })
+                .unwrap_or(true),
+            EntryDateQuery::Running => entry.ended_at.is_none(),
+        };
+        date_is_match
+    }
+}
+
+impl ProjectStatsQuery {
+    fn is_match(&self, entry: &Entry, now: DateTime) -> bool {
+        match self {
+            ProjectStatsQuery::WeeklyBy(project_ids) => {
+                let now_date = now.date_naive();
+                project_ids.contains(&entry.project_id)
+                    && entry
+                        .ended_at
+                        .map(|ended_at| {
+                            let ended_at = ended_at.date_naive();
+                            let now_week = now_date.iso_week();
+                            let ended_at_week = ended_at.iso_week();
+                            ended_at_week.year() == now_week.year()
+                                && ended_at_week.week() == now_week.week()
+                        })
+                        .unwrap_or(true)
+            }
+        }
+    }
+}
+
+impl ProjectStatsRepository for JsonEntryRepository {
+    fn list(&self, query: super::ProjectStatsQuery) -> Result<Vec<ProjectStats>> {
+        let now = self.now_provider.now();
+        let mut entries_by_project_id = self
+            .entries
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|entry| query.is_match(entry, now))
+            .fold(
+                HashMap::new(),
+                |mut acc: HashMap<ProjectId, Vec<Entry>>, entry| {
+                    acc.entry(entry.project_id)
+                        .or_insert_with(Vec::new)
+                        .push(entry.clone());
+                    acc
+                },
+            );
+
+        match query {
+            ProjectStatsQuery::WeeklyBy(project_ids) => {
+                project_ids.iter().for_each(|project_id| {
+                    entries_by_project_id
+                        .entry(project_id.clone())
+                        .or_insert(Vec::new());
+                });
+            }
+        };
+
+        let first_day_current_week = first_day_current_week(now)
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        Ok(entries_by_project_id
+            .iter()
+            .map(|(project_id, entries)| ProjectStats {
+                project_id: *project_id,
+                entries_count: entries.len(),
+                week_time: entries.iter().fold(Duration::zero(), |acc, entry| {
+                    let left_border = if entry.started_at > first_day_current_week {
+                        entry.started_at
+                    } else {
+                        first_day_current_week
+                    };
+                    let right_border = entry.ended_at.unwrap_or(now);
+                    acc + (right_border - left_border)
+                }),
+            })
+            .collect())
     }
 }
 
 impl EntryRepository for JsonEntryRepository {
     fn total(&self, query: EntryQuery) -> i64 {
+        let now = self.now_provider.now();
         self.entries
             .read()
             .unwrap()
             .iter()
-            .filter(|entry| query.is_match(entry))
+            .filter(|entry| query.is_match(entry, now))
             .count() as i64
     }
 
@@ -326,12 +452,13 @@ impl EntryRepository for JsonEntryRepository {
         if paging.limit == 0 {
             return Ok(Vec::new());
         }
+        let now = self.now_provider.now();
         let mut entries: Vec<Entry> = self
             .entries
             .read()
             .unwrap()
             .iter()
-            .filter(|entry| query.is_match(entry))
+            .filter(|entry| query.is_match(entry, now))
             .cloned()
             .collect();
         entries.sort_by(|a, b| a.id.cmp(&b.id));
@@ -403,14 +530,20 @@ impl EntryRepository for JsonEntryRepository {
     }
 }
 
+fn first_day_current_week(now: DateTime) -> NaiveDate {
+    let now = now.date_naive();
+    now - Duration::days((now.weekday().number_from_monday() - 1) as i64)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
+    use chrono::{DateTime, TimeZone, Utc};
     use tempfile::NamedTempFile;
 
     use super::super::contract;
-    use crate::repository::json::{JsonEntryRepository, JsonProjectRepository};
+    use crate::repository::json::{JsonEntryRepository, JsonProjectRepository, NowProvider};
 
     #[test]
     fn should_sucess_create_project_when_model_is_valid() {
@@ -545,6 +678,17 @@ mod tests {
     }
 
     #[test]
+    fn should_return_correct_project_stats() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 9, 15, 22, 0, 0)
+            .single()
+            .unwrap();
+        let fixture = create_entry_repository_fixture_with_static_now(now);
+        let repository = &fixture.repository();
+        contract::should_return_correct_project_stats(repository, repository, now);
+    }
+
+    #[test]
     fn should_return_total_entries() {
         let fixture = create_entry_repository_fixture();
         contract::should_return_total_entries(&fixture.repository());
@@ -580,6 +724,16 @@ mod tests {
         contract::should_can_filter_entries_by_project_id(&fixture.repository());
     }
 
+    #[test]
+    fn should_can_filter_entries_by_date() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 9, 15, 22, 0, 0)
+            .single()
+            .unwrap();
+        let fixture = create_entry_repository_fixture_with_static_now(now);
+        contract::should_can_filter_entries_by_date(&fixture.repository(), now);
+    }
+
     struct RepositoryFixture<R, F>
     where
         F: Fn(&Path) -> R,
@@ -613,6 +767,21 @@ mod tests {
             file: empty_entries_file(),
             repository_factory: |file_path| {
                 JsonEntryRepository::new(file_path.to_path_buf()).unwrap()
+            },
+        }
+    }
+
+    fn create_entry_repository_fixture_with_static_now(
+        now: DateTime<Utc>,
+    ) -> RepositoryFixture<JsonEntryRepository, impl Fn(&Path) -> JsonEntryRepository> {
+        RepositoryFixture {
+            file: empty_entries_file(),
+            repository_factory: move |file_path| {
+                JsonEntryRepository::new_with_now_provider(
+                    file_path.to_path_buf(),
+                    NowProvider::Stub(now),
+                )
+                .unwrap()
             },
         }
     }

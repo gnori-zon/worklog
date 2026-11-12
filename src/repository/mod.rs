@@ -1,6 +1,8 @@
 pub mod json;
 
-use crate::models::{Entry, EntryId, Project, ProjectId};
+use std::collections::HashSet;
+
+use crate::models::{Entry, EntryId, Project, ProjectId, ProjectStats};
 
 #[derive(Debug)]
 pub enum Error {
@@ -47,8 +49,8 @@ pub type Result<V> = std::result::Result<V, Error>;
 
 #[derive(Debug, Clone)]
 pub struct Paging {
-    offset: usize,
-    limit: usize,
+    pub offset: usize,
+    pub limit: usize,
 }
 
 impl Default for Paging {
@@ -89,6 +91,22 @@ pub trait ProjectRepository {
 pub struct EntryQuery {
     pub name: EntryNameQuery,
     pub project: EntryProjectQuery,
+    pub date: EntryDateQuery,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EntryDateQuery {
+    Any,
+    Running,
+    Today,
+    Week,
+    Mounth,
+}
+
+impl Default for EntryDateQuery {
+    fn default() -> Self {
+        EntryDateQuery::Any
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +141,15 @@ pub trait EntryRepository {
     fn delete(&self, id: EntryId) -> Result<()>;
 }
 
+#[derive(Debug, Clone)]
+pub enum ProjectStatsQuery {
+    WeeklyBy(HashSet<ProjectId>),
+}
+
+pub trait ProjectStatsRepository {
+    fn list(&self, query: ProjectStatsQuery) -> Result<Vec<ProjectStats>>;
+}
+
 #[cfg(test)]
 pub mod contract {
     use std::{collections::HashSet, ops::Add};
@@ -130,14 +157,15 @@ pub mod contract {
     use crate::{
         models::{Entry, Project},
         repository::{
-            EntryNameQuery,
+            EntryDateQuery, EntryNameQuery,
             EntryProjectQuery::{self},
             EntryQuery, EntryRepository,
             Error::{IdAlreadyUsed, NameAlreadyUsed, NotExistsById},
-            Paging, ProjectNameQuery, ProjectQuery, ProjectRepository,
+            Paging, ProjectNameQuery, ProjectQuery, ProjectRepository, ProjectStatsQuery,
+            ProjectStatsRepository, Result,
         },
     };
-    use chrono::Utc;
+    use chrono::{DateTime, Duration, Utc};
     use uuid::Uuid;
 
     pub fn should_sucess_create_project_when_model_is_valid<R: ProjectRepository>(repository: &R) {
@@ -613,10 +641,7 @@ pub mod contract {
             started_at: Utc::now(),
             ended_at: None,
         };
-        let query = EntryQuery {
-            name: EntryNameQuery::Any,
-            project: EntryProjectQuery::Any,
-        };
+        let query = EntryQuery::default();
 
         let result = repository.create(create_entry.clone());
         let found_entries = repository.list(query.clone(), Paging::default());
@@ -651,13 +676,7 @@ pub mod contract {
 
         let result = repository.create(create_entry.clone());
         let duplicate_result = repository.create(duplicate_create_entry);
-        let found_entries = repository.list(
-            EntryQuery {
-                name: EntryNameQuery::Any,
-                project: EntryProjectQuery::Any,
-            },
-            Paging::default(),
-        );
+        let found_entries = repository.list(EntryQuery::default(), Paging::default());
 
         assert!(result.is_ok());
         assert!(duplicate_result.is_err());
@@ -704,13 +723,7 @@ pub mod contract {
             repository.create(duplcate_create_entry_in_same_project.clone());
         let duplicate_create_entry_in_other_project_result =
             repository.create(duplcate_create_entry_in_other_project.clone());
-        let found_entries = repository.list(
-            EntryQuery {
-                name: EntryNameQuery::Any,
-                project: EntryProjectQuery::Any,
-            },
-            Paging::default(),
-        );
+        let found_entries = repository.list(EntryQuery::default(), Paging::default());
 
         assert!(create_result.is_ok());
         assert!(duplicate_create_entry_in_other_project_result.is_ok());
@@ -742,13 +755,7 @@ pub mod contract {
         };
         let create_result = repository.create(create_entry);
         let update_result = repository.update(update_entry.clone());
-        let found_entries = repository.list(
-            EntryQuery {
-                name: EntryNameQuery::Any,
-                project: EntryProjectQuery::Any,
-            },
-            Paging::default(),
-        );
+        let found_entries = repository.list(EntryQuery::default(), Paging::default());
 
         assert!(create_result.is_ok());
         assert!(update_result.is_ok());
@@ -769,13 +776,7 @@ pub mod contract {
         };
 
         let update_result = repository.update(update_entry);
-        let found_entries = repository.list(
-            EntryQuery {
-                name: EntryNameQuery::Any,
-                project: EntryProjectQuery::Any,
-            },
-            Paging::default(),
-        );
+        let found_entries = repository.list(EntryQuery::default(), Paging::default());
 
         assert!(update_result.is_err());
         assert!(
@@ -851,10 +852,7 @@ pub mod contract {
             started_at: Utc::now(),
             ended_at: None,
         };
-        let all_entries_query = EntryQuery {
-            name: EntryNameQuery::Any,
-            project: EntryProjectQuery::Any,
-        };
+        let all_entries_query = EntryQuery::default();
 
         let create_result = repository.create(entry);
         let found_entries_after_create =
@@ -883,10 +881,7 @@ pub mod contract {
     }
 
     pub fn should_return_total_entries<R: EntryRepository>(repository: &R) {
-        let all_entry_query = EntryQuery {
-            name: EntryNameQuery::Any,
-            project: EntryProjectQuery::Any,
-        };
+        let all_entry_query = EntryQuery::default();
         let all_total_before_create = repository.total(all_entry_query.clone());
         let first_project_id = Uuid::now_v7();
         let second_project_id = Uuid::now_v7();
@@ -909,18 +904,22 @@ pub mod contract {
         let total_filtered_by_first_substr = repository.total(EntryQuery {
             name: EntryNameQuery::Contains("first".to_string()),
             project: EntryProjectQuery::Any,
+            date: EntryDateQuery::Any,
         });
         let total_filtered_by_second_substr = repository.total(EntryQuery {
             name: EntryNameQuery::Contains("second".to_string()),
             project: EntryProjectQuery::Any,
+            date: EntryDateQuery::Any,
         });
         let total_filtered_by_first_project = repository.total(EntryQuery {
             name: EntryNameQuery::Any,
             project: EntryProjectQuery::In(first_project_id),
+            date: EntryDateQuery::Any,
         });
         let total_filtered_by_second_project = repository.total(EntryQuery {
             name: EntryNameQuery::Any,
             project: EntryProjectQuery::In(second_project_id),
+            date: EntryDateQuery::Any,
         });
 
         assert_eq!(all_total_before_create, 0);
@@ -931,6 +930,88 @@ pub mod contract {
         assert_eq!(total_filtered_by_second_substr, 1);
         assert_eq!(total_filtered_by_first_project, 1);
         assert_eq!(total_filtered_by_second_project, 1);
+    }
+
+    pub fn should_return_correct_project_stats<PR: ProjectStatsRepository, ER: EntryRepository>(
+        project_stats_repository: &PR,
+        entry_repository: &ER,
+        now: DateTime<Utc>,
+    ) {
+        let first_project_id = Uuid::now_v7();
+        let second_project_id = Uuid::now_v7();
+        let third_project_id = Uuid::now_v7();
+        let sec_ago = now - Duration::seconds(1);
+
+        let first_project_entries = [
+            Entry {
+                id: Uuid::now_v7(),
+                project_id: first_project_id,
+                name: String::from("entry1"),
+                started_at: sec_ago,
+                ended_at: Some(now),
+            },
+            Entry {
+                id: Uuid::now_v7(),
+                project_id: first_project_id,
+                name: String::from("entry2"),
+                started_at: sec_ago,
+                ended_at: Some(now),
+            },
+        ];
+        let second_project_entries = [Entry {
+            id: Uuid::now_v7(),
+            project_id: second_project_id,
+            name: String::from("entry3"),
+            started_at: sec_ago,
+            ended_at: Some(now),
+        }];
+
+        let create_results: Vec<Result<()>> = first_project_entries
+            .into_iter()
+            .chain(second_project_entries.into_iter())
+            .map(|entry| entry_repository.create(entry))
+            .collect();
+
+        let project_stats =
+            project_stats_repository.list(ProjectStatsQuery::WeeklyBy(HashSet::from([
+                first_project_id,
+                second_project_id,
+                third_project_id,
+            ])));
+
+        create_results
+            .iter()
+            .for_each(|result| assert!(result.is_ok()));
+
+        assert!(project_stats.is_ok());
+        let project_stats = project_stats.unwrap();
+        assert_eq!(3, project_stats.len());
+        let first_project_stats = project_stats
+            .iter()
+            .find(|stats| stats.project_id == first_project_id);
+        assert!(first_project_stats.is_some());
+        let first_project_stats = first_project_stats.unwrap();
+        assert_eq!(first_project_id, first_project_stats.project_id);
+        assert_eq!(2, first_project_stats.entries_count);
+        assert_eq!((now - sec_ago) * 2, first_project_stats.week_time);
+
+        let second_project_stats = project_stats
+            .iter()
+            .find(|stats| stats.project_id == second_project_id);
+        assert!(second_project_stats.is_some());
+        let second_project_stats = second_project_stats.unwrap();
+        assert_eq!(second_project_id, second_project_stats.project_id);
+        assert_eq!(1, second_project_stats.entries_count);
+        assert_eq!(now - sec_ago, second_project_stats.week_time);
+
+        let third_project_stats = project_stats
+            .iter()
+            .find(|stats| stats.project_id == third_project_id);
+        assert!(third_project_stats.is_some());
+        let third_project_stats = third_project_stats.unwrap();
+        assert_eq!(third_project_id, third_project_stats.project_id);
+        assert_eq!(0, third_project_stats.entries_count);
+        assert_eq!(Duration::zero(), third_project_stats.week_time);
     }
 
     pub fn should_return_empty_entries_when_limit_is_zero<R: EntryRepository>(repository: &R) {
@@ -944,20 +1025,14 @@ pub mod contract {
         });
 
         let list_with_not_zero_limit_result = repository.list(
-            EntryQuery {
-                name: EntryNameQuery::Any,
-                project: EntryProjectQuery::Any,
-            },
+            EntryQuery::default(),
             Paging {
                 offset: 0,
                 limit: 1,
             },
         );
         let list_with_zero_limit_result = repository.list(
-            EntryQuery {
-                name: EntryNameQuery::Any,
-                project: EntryProjectQuery::Any,
-            },
+            EntryQuery::default(),
             Paging {
                 offset: 0,
                 limit: 0,
@@ -982,20 +1057,14 @@ pub mod contract {
         });
 
         let list_with_limit_eq_size = repository.list(
-            EntryQuery {
-                name: EntryNameQuery::Any,
-                project: EntryProjectQuery::Any,
-            },
+            EntryQuery::default(),
             Paging {
                 offset: 0,
                 limit: 1,
             },
         );
         let list_with_limit_gt_size = repository.list(
-            EntryQuery {
-                name: EntryNameQuery::Any,
-                project: EntryProjectQuery::Any,
-            },
+            EntryQuery::default(),
             Paging {
                 offset: 0,
                 limit: 5,
@@ -1012,10 +1081,7 @@ pub mod contract {
     pub fn should_can_paginate_by_entries_using_offset_and_limit<R: EntryRepository>(
         repository: &R,
     ) {
-        let all_query = EntryQuery {
-            name: EntryNameQuery::Any,
-            project: EntryProjectQuery::Any,
-        };
+        let all_query = EntryQuery::default();
         let entry_ids: HashSet<Uuid> = (0..5).map(|_| Uuid::now_v7()).collect();
         let entries: Vec<Entry> = entry_ids
             .iter()
@@ -1099,10 +1165,7 @@ pub mod contract {
             offset: 0,
             limit: 5,
         };
-        let all_entries_query = EntryQuery {
-            name: EntryNameQuery::Any,
-            project: EntryProjectQuery::Any,
-        };
+        let all_entries_query = EntryQuery::default();
         let list_all_before_create = repository.list(all_entries_query.clone(), paging.clone());
 
         let first_create_result = repository.create(Entry {
@@ -1125,6 +1188,7 @@ pub mod contract {
             EntryQuery {
                 name: EntryNameQuery::Contains("first".to_string()),
                 project: EntryProjectQuery::Any,
+                date: EntryDateQuery::Any,
             },
             paging.clone(),
         );
@@ -1132,6 +1196,7 @@ pub mod contract {
             EntryQuery {
                 name: EntryNameQuery::Contains("second".to_string()),
                 project: EntryProjectQuery::Any,
+                date: EntryDateQuery::Any,
             },
             paging.clone(),
         );
@@ -1139,6 +1204,7 @@ pub mod contract {
             EntryQuery {
                 name: EntryNameQuery::Contains("nam".to_string()),
                 project: EntryProjectQuery::Any,
+                date: EntryDateQuery::Any,
             },
             paging.clone(),
         );
@@ -1167,10 +1233,7 @@ pub mod contract {
             offset: 0,
             limit: 5,
         };
-        let all_entries_query = EntryQuery {
-            name: EntryNameQuery::Any,
-            project: EntryProjectQuery::Any,
-        };
+        let all_entries_query = EntryQuery::default();
         let list_all_before_create = repository.list(all_entries_query.clone(), paging.clone());
         let first_project_id = Uuid::now_v7();
         let second_project_id = Uuid::now_v7();
@@ -1195,6 +1258,7 @@ pub mod contract {
             EntryQuery {
                 name: EntryNameQuery::Any,
                 project: EntryProjectQuery::In(first_project_id),
+                date: EntryDateQuery::Any,
             },
             paging.clone(),
         );
@@ -1202,6 +1266,7 @@ pub mod contract {
             EntryQuery {
                 name: EntryNameQuery::Any,
                 project: EntryProjectQuery::In(second_project_id),
+                date: EntryDateQuery::Any,
             },
             paging.clone(),
         );
@@ -1220,5 +1285,185 @@ pub mod contract {
         assert!(list_filtered_by_second_project.is_ok());
         let list_filtered_by_second_substr = list_filtered_by_second_project.unwrap();
         assert_eq!(list_filtered_by_second_substr.len(), 1);
+    }
+
+    pub fn should_can_filter_entries_by_date<R: EntryRepository>(
+        repository: &R,
+        now: DateTime<Utc>,
+    ) {
+        let all_entries_query = EntryQuery::default();
+        let paging = Paging {
+            offset: 0,
+            limit: 10,
+        };
+        let list_all_before_create = repository.list(all_entries_query.clone(), paging.clone());
+
+        let running_entry = Entry {
+            id: Uuid::now_v7(),
+            project_id: Uuid::now_v7(),
+            name: Uuid::now_v7().to_string(),
+            started_at: now,
+            ended_at: None,
+        };
+        let finished_today_entry = Entry {
+            id: Uuid::now_v7(),
+            project_id: Uuid::now_v7(),
+            name: Uuid::now_v7().to_string(),
+            started_at: now,
+            ended_at: Some(now),
+        };
+        let finished_day_ago_entry = Entry {
+            id: Uuid::now_v7(),
+            project_id: Uuid::now_v7(),
+            name: Uuid::now_v7().to_string(),
+            started_at: now,
+            ended_at: Some(now - Duration::days(1)),
+        };
+
+        let finished_week_ago_entry = Entry {
+            id: Uuid::now_v7(),
+            project_id: Uuid::now_v7(),
+            name: Uuid::now_v7().to_string(),
+            started_at: now,
+            ended_at: Some(now - Duration::weeks(1)),
+        };
+
+        let finished_mounth_ago_entry = Entry {
+            id: Uuid::now_v7(),
+            project_id: Uuid::now_v7(),
+            name: Uuid::now_v7().to_string(),
+            started_at: now,
+            ended_at: Some(now - Duration::weeks(5)),
+        };
+
+        let create_results: Vec<Result<()>> = [
+            running_entry.clone(),
+            finished_today_entry.clone(),
+            finished_day_ago_entry.clone(),
+            finished_week_ago_entry.clone(),
+            finished_mounth_ago_entry.clone(),
+        ]
+        .iter()
+        .cloned()
+        .map(|entry| repository.create(entry))
+        .collect();
+
+        let list_running = repository.list(
+            EntryQuery {
+                date: EntryDateQuery::Running,
+                ..Default::default()
+            },
+            paging.clone(),
+        );
+        let list_today = repository.list(
+            EntryQuery {
+                date: EntryDateQuery::Today,
+                ..Default::default()
+            },
+            paging.clone(),
+        );
+        let list_week = repository.list(
+            EntryQuery {
+                date: EntryDateQuery::Week,
+                ..Default::default()
+            },
+            paging.clone(),
+        );
+        let list_month = repository.list(
+            EntryQuery {
+                date: EntryDateQuery::Mounth,
+                ..Default::default()
+            },
+            paging.clone(),
+        );
+        let list_all_after_create = repository.list(
+            EntryQuery {
+                date: EntryDateQuery::Any,
+                ..Default::default()
+            },
+            paging.clone(),
+        );
+
+        assert!(list_all_before_create.is_ok_and(|result| result.len() == 0));
+        create_results
+            .iter()
+            .for_each(|create_result| assert!(create_result.is_ok()));
+
+        assert!(list_running.is_ok_and(|list| {
+            list.len() == 1
+                && list
+                    .iter()
+                    .find(|item| item.id == running_entry.id.clone())
+                    .is_some()
+        }));
+
+        assert!(list_today.is_ok_and(|list| {
+            list.len() == 2
+                && list
+                    .iter()
+                    .find(|item| item.id == running_entry.id.clone())
+                    .is_some()
+                && list
+                    .iter()
+                    .find(|item| item.id == finished_today_entry.id.clone())
+                    .is_some()
+        }));
+        assert!(list_week.is_ok_and(|list| {
+            list.len() == 3
+                && list
+                    .iter()
+                    .find(|item| item.id == running_entry.id.clone())
+                    .is_some()
+                && list
+                    .iter()
+                    .find(|item| item.id == finished_today_entry.id.clone())
+                    .is_some()
+                && list
+                    .iter()
+                    .find(|item| item.id == finished_day_ago_entry.id.clone())
+                    .is_some()
+        }));
+        assert!(list_month.is_ok_and(|list| {
+            list.len() == 4
+                && list
+                    .iter()
+                    .find(|item| item.id == running_entry.id.clone())
+                    .is_some()
+                && list
+                    .iter()
+                    .find(|item| item.id == finished_today_entry.id.clone())
+                    .is_some()
+                && list
+                    .iter()
+                    .find(|item| item.id == finished_day_ago_entry.id.clone())
+                    .is_some()
+                && list
+                    .iter()
+                    .find(|item| item.id == finished_week_ago_entry.id.clone())
+                    .is_some()
+        }));
+        assert!(list_all_after_create.is_ok_and(|list| {
+            list.len() == 5
+                && list
+                    .iter()
+                    .find(|item| item.id == running_entry.id.clone())
+                    .is_some()
+                && list
+                    .iter()
+                    .find(|item| item.id == finished_today_entry.id.clone())
+                    .is_some()
+                && list
+                    .iter()
+                    .find(|item| item.id == finished_day_ago_entry.id.clone())
+                    .is_some()
+                && list
+                    .iter()
+                    .find(|item| item.id == finished_week_ago_entry.id.clone())
+                    .is_some()
+                && list
+                    .iter()
+                    .find(|item| item.id == finished_mounth_ago_entry.id.clone())
+                    .is_some()
+        }));
     }
 }
