@@ -3,6 +3,10 @@ name = "worklog"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "worklog"
+path = "src/main.rs"
+
 [dependencies]
 chrono = { version = "0.4.45", features = ["serde"] }
 color-eyre = "0.6.5"
